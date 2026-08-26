@@ -6,7 +6,7 @@ Project ini dibuat sebagai command-line tool yang sederhana. Tidak membutuhkan F
 
 Repository:
 
-https://github.com/walidumar/mon-log-webserver-linux/
+https://github.com/walidumar/mon-log-webserver/
 
 ## Fitur
 
@@ -91,8 +91,8 @@ Tidak perlu `pip install`.
 Clone repository:
 
 ```bash
-git clone https://github.com/walidumar/mon-log-webserver-linux.git
-cd mon-log-webserver-linux
+git clone https://github.com/walidumar/mon-log-webserver.git
+cd mon-log-webserver
 ```
 
 Pastikan file utama bernama:
