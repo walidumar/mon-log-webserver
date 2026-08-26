@@ -1,0 +1,1340 @@
+#!/usr/bin/env python3
+"""
+MON-LOG
+Web Server Log Intelligence
+Apache2 + Nginx | Custom VHost | Smart Log Detection
+
+Usage:
+    sudo mon-log
+    sudo mon-log --port 9090
+    sudo mon-log --summary
+    sudo mon-log --detect
+
+Install globally:
+    sudo cp mon-log /usr/local/bin/mon-log
+    sudo chmod +x /usr/local/bin/mon-log
+
+Requirements:
+    Python 3.9+
+    Python Standard Library only
+
+No Flask, pip, venv, database, or systemd required.
+"""
+
+import argparse
+import gzip
+import glob
+import html
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import threading
+import time
+from collections import Counter
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+
+APP_NAME = "Web Server Log Intelligence"
+VERSION = "1.0.0"
+HOST = "127.0.0.1"
+PORT = 8080
+
+LOG_DIRS = {
+    "Apache2": ["/var/log/apache2"],
+    "Nginx": ["/var/log/nginx"],
+}
+
+MAX_LINES_PER_FILE = 500_000
+SAMPLE_LINES = 80
+MAX_SECURITY_EVENTS = 300
+REFRESH_SECONDS = 15
+
+
+ACCESS_REGEX = re.compile(
+    r'^(?P<ip>\S+)\s+\S+\s+\S+\s+'
+    r'\[(?P<time>[^\]]+)\]\s+'
+    r'"(?P<request>[^"]*)"\s+'
+    r'(?P<status>\d{3})\s+'
+    r'(?P<size>\S+)'
+    r'(?:\s+"(?P<referer>[^"]*)"\s+"(?P<agent>[^"]*)")?'
+)
+
+APACHE_ERROR_REGEX = re.compile(
+    r'^\[(?P<time>[^\]]+)\]\s+'
+    r'\[(?P<module>[^\]]+)\]\s*'
+    r'(?:\[pid\s+(?P<pid>\d+)\])?\s*'
+    r'(?P<message>.*)$'
+)
+
+NGINX_ERROR_REGEX = re.compile(
+    r'^(?P<time>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+'
+    r'\[(?P<level>[^\]]+)\]\s+'
+    r'(?:\d+#\d+:\s*)?'
+    r'(?P<message>.*)$'
+)
+
+SECURITY_PATTERNS = {
+    "SQL Injection": [
+        r"union\s+select",
+        r"select\s+.*from",
+        r"information_schema",
+        r"sleep\s*\(",
+        r"benchmark\s*\(",
+        r"or\s+1\s*=\s*1",
+        r"and\s+1\s*=\s*1",
+        r"load_file\s*\(",
+    ],
+    "Command Injection": [
+        r";\s*(wget|curl|bash|sh|python|perl|nc)\b",
+        r"\|\s*(wget|curl|bash|sh|python|perl|nc)\b",
+        r"`[^`]+`",
+        r"\$\([^)]+\)",
+    ],
+    "Path Traversal": [
+        r"\.\./",
+        r"%2e%2e",
+        r"%252e%252e",
+        r"%2e%2e%2f",
+    ],
+    "Sensitive File Probe": [
+        r"/\.env(?:/|$|\?)",
+        r"/\.git(?:/|$|\?)",
+        r"/\.htaccess",
+        r"/\.htpasswd",
+        r"/\.ssh/",
+        r"/id_rsa",
+        r"/wp-config\.php",
+        r"/phpinfo\.php",
+        r"/composer\.json",
+        r"/package\.json",
+        r"/docker-compose\.yml",
+    ],
+    "WordPress Scan": [
+        r"/wp-admin",
+        r"/wp-login\.php",
+        r"/wp-content",
+        r"/wp-includes",
+        r"/xmlrpc\.php",
+    ],
+    "PHPMyAdmin Scan": [
+        r"/phpmyadmin",
+        r"/phpmyadmin/",
+        r"/pma/",
+        r"/adminer",
+    ],
+    "Common Scanner": [
+        r"/manager/html",
+        r"/actuator",
+        r"/server-status",
+        r"/server-info",
+        r"/cgi-bin/",
+        r"/jenkins/",
+        r"/console/",
+    ],
+    "XSS Attempt": [
+        r"<script",
+        r"javascript:",
+        r"onerror=",
+        r"onload=",
+        r"<iframe",
+    ],
+    "File Inclusion": [
+        r"etc/passwd",
+        r"etc/shadow",
+        r"proc/self/environ",
+        r"php://",
+        r"file://",
+        r"data://",
+    ],
+}
+
+ACCESS_NAME_HINTS = (
+    "access", "request", "requests", "traffic", "http", "web"
+)
+ERROR_NAME_HINTS = (
+    "error", "errors", "err"
+)
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def human_bytes(value):
+    value = float(value or 0)
+    units = ("B", "KB", "MB", "GB", "TB")
+    index = 0
+    while value >= 1024 and index < len(units) - 1:
+        value /= 1024
+        index += 1
+    return f"{value:.1f} {units[index]}"
+
+
+def risk_level(score):
+    if score >= 80:
+        return "CRITICAL"
+    if score >= 60:
+        return "HIGH"
+    if score >= 30:
+        return "MEDIUM"
+    if score > 0:
+        return "LOW"
+    return "NORMAL"
+
+
+def discover_files(directory):
+    patterns = [
+        os.path.join(directory, "*"),
+        os.path.join(directory, ".*"),
+    ]
+    files = set()
+
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            if not os.path.isfile(path):
+                continue
+            name = os.path.basename(path).lower()
+            if name in (".", ".."):
+                continue
+            # Skip obvious non-log files. Unknown names are still allowed
+            # when they have log-like content.
+            if (
+                name.endswith((".log", ".gz"))
+                or ".log." in name
+                or "access" in name
+                or "error" in name
+                or "request" in name
+                or "traffic" in name
+            ):
+                files.add(path)
+
+    return sorted(
+        files,
+        key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+        reverse=True,
+    )
+
+
+def read_lines(path, limit=MAX_LINES_PER_FILE):
+    try:
+        opener = gzip.open if path.lower().endswith(".gz") else open
+        mode = "rt"
+        with opener(path, mode, encoding="utf-8", errors="replace") as fh:
+            for index, line in enumerate(fh):
+                if index >= limit:
+                    break
+                yield line.rstrip("\n")
+    except (PermissionError, OSError):
+        return
+
+
+def sample_lines(path):
+    result = []
+    for line in read_lines(path, SAMPLE_LINES):
+        if line.strip():
+            result.append(line)
+    return result
+
+
+def parse_access(line):
+    match = ACCESS_REGEX.match(line)
+    if not match:
+        return None
+
+    request = match.group("request") or ""
+    parts = request.split()
+
+    return {
+        "ip": match.group("ip"),
+        "time": match.group("time"),
+        "method": parts[0] if len(parts) > 0 else "-",
+        "url": parts[1] if len(parts) > 1 else "-",
+        "protocol": parts[2] if len(parts) > 2 else "-",
+        "status": safe_int(match.group("status")),
+        "size": 0 if match.group("size") == "-" else safe_int(match.group("size")),
+        "referer": match.group("referer") or "-",
+        "agent": match.group("agent") or "-",
+    }
+
+
+def parse_error(line, server):
+    if server == "Apache2":
+        match = APACHE_ERROR_REGEX.match(line)
+        if not match:
+            return None
+        return {
+            "time": match.group("time"),
+            "level": match.group("module"),
+            "message": match.group("message"),
+        }
+
+    if server == "Nginx":
+        match = NGINX_ERROR_REGEX.match(line)
+        if not match:
+            return None
+        return {
+            "time": match.group("time"),
+            "level": match.group("level"),
+            "message": match.group("message"),
+        }
+
+    return None
+
+
+def classify_file(path, server):
+    """
+    Smart classifier:
+    1. filename hints
+    2. access/error content signatures
+    3. returns access/error/unknown
+    """
+    name = os.path.basename(path).lower()
+
+    for hint in ACCESS_NAME_HINTS:
+        if hint in name:
+            return "access"
+
+    for hint in ERROR_NAME_HINTS:
+        if hint in name:
+            return "error"
+
+    access_score = 0
+    error_score = 0
+
+    for line in sample_lines(path):
+        if ACCESS_REGEX.match(line):
+            access_score += 10
+
+        if re.search(
+            r'"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|CONNECT)\s+\S+',
+            line,
+            re.I,
+        ):
+            access_score += 4
+
+        if re.search(r'"\s+\d{3}\s+\S+', line):
+            access_score += 4
+
+        if APACHE_ERROR_REGEX.match(line):
+            error_score += 10
+
+        if NGINX_ERROR_REGEX.match(line):
+            error_score += 10
+
+        if re.search(
+            r'\[(error|warn|notice|crit|alert|emerg)\]',
+            line,
+            re.I,
+        ):
+            error_score += 4
+
+    if access_score > error_score and access_score >= 8:
+        return "access"
+    if error_score > access_score and error_score >= 8:
+        return "error"
+    return "unknown"
+
+
+def vhost_from_filename(path):
+    name = os.path.basename(path).lower()
+    name = re.sub(r"\.gz$", "", name)
+    name = re.sub(r"\.\d+$", "", name)
+
+    patterns = (
+        r"[-_]?access(?:log)?\.log$",
+        r"[-_]?error(?:s)?\.log$",
+        r"[-_]?requests?\.log$",
+        r"[-_]?traffic\.log$",
+    )
+
+    for pattern in patterns:
+        name = re.sub(pattern, "", name, flags=re.I)
+
+    if name in ("", "access", "error", "requests", "request", "traffic"):
+        return "default"
+
+    return name
+
+
+def security_events(url, agent, method):
+    text = f"{url} {agent}"
+    found = []
+
+    for category, patterns in SECURITY_PATTERNS.items():
+        for pattern in patterns:
+            try:
+                if re.search(pattern, text, re.I):
+                    found.append(category)
+                    break
+            except re.error:
+                continue
+
+    if method.upper() not in {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT"
+    }:
+        found.append("Abnormal HTTP Method")
+
+    if len(url) > 2048:
+        found.append("Abnormally Long URL")
+
+    return list(dict.fromkeys(found))
+
+
+def security_score(security, status):
+    score = 0
+    score += min(security.get("SQL Injection", 0) * 5, 30)
+    score += min(security.get("Command Injection", 0) * 8, 30)
+    score += min(security.get("Path Traversal", 0) * 5, 20)
+    score += min(security.get("Sensitive File Probe", 0) * 2, 15)
+    score += min(security.get("Common Scanner", 0) * 2, 10)
+    score += min(security.get("XSS Attempt", 0) * 4, 20)
+    score += min(status.get("500", 0) // 20, 10)
+    return min(score, 100)
+
+
+def empty_vhost():
+    return {
+        "requests": 0,
+        "errors": 0,
+        "bytes": 0,
+        "status": Counter(),
+        "methods": Counter(),
+        "ips": Counter(),
+        "urls": Counter(),
+        "security": Counter(),
+        "access_files": [],
+        "error_files": [],
+        "events": [],
+    }
+
+
+def analyze_server(server, directory):
+    result = {
+        "server": server,
+        "directory": directory,
+        "files": [],
+        "vhosts": {},
+        "requests": 0,
+        "errors": 0,
+        "bytes": 0,
+        "status": Counter(),
+        "methods": Counter(),
+        "ips": Counter(),
+        "urls": Counter(),
+        "agents": Counter(),
+        "referers": Counter(),
+        "timeline": Counter(),
+        "security": Counter(),
+        "events": [],
+        "error_levels": Counter(),
+        "error_messages": Counter(),
+        "parse_failures": 0,
+    }
+
+    for path in discover_files(directory):
+        log_type = classify_file(path, server)
+        if log_type == "unknown":
+            continue
+
+        vhost = vhost_from_filename(path)
+        result["vhosts"].setdefault(vhost, empty_vhost())
+        vh = result["vhosts"][vhost]
+
+        try:
+            size = os.path.getsize(path)
+            modified = datetime.fromtimestamp(
+                os.path.getmtime(path)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        except OSError:
+            size = 0
+            modified = "-"
+
+        result["files"].append({
+            "path": path,
+            "type": log_type,
+            "vhost": vhost,
+            "size": size,
+            "modified": modified,
+        })
+
+        if log_type == "access":
+            vh["access_files"].append(path)
+
+            for line in read_lines(path):
+                parsed = parse_access(line)
+                if not parsed:
+                    result["parse_failures"] += 1
+                    continue
+
+                result["requests"] += 1
+                result["bytes"] += parsed["size"]
+                result["status"][str(parsed["status"])] += 1
+                result["methods"][parsed["method"]] += 1
+                result["ips"][parsed["ip"]] += 1
+                result["urls"][parsed["url"]] += 1
+                result["agents"][parsed["agent"]] += 1
+                result["referers"][parsed["referer"]] += 1
+
+                vh["requests"] += 1
+                vh["bytes"] += parsed["size"]
+                vh["status"][str(parsed["status"])] += 1
+                vh["methods"][parsed["method"]] += 1
+                vh["ips"][parsed["ip"]] += 1
+                vh["urls"][parsed["url"]] += 1
+
+                try:
+                    stamp = parsed["time"].split()[0]
+                    dt = datetime.strptime(
+                        stamp, "%d/%b/%Y:%H:%M:%S"
+                    )
+                    result["timeline"][dt.strftime("%Y-%m-%d %H:00")] += 1
+                except Exception:
+                    pass
+
+                detections = security_events(
+                    parsed["url"],
+                    parsed["agent"],
+                    parsed["method"],
+                )
+
+                for detection in detections:
+                    result["security"][detection] += 1
+                    vh["security"][detection] += 1
+
+                    event = {
+                        "server": server,
+                        "vhost": vhost,
+                        "source": os.path.basename(path),
+                        "ip": parsed["ip"],
+                        "method": parsed["method"],
+                        "url": parsed["url"],
+                        "status": parsed["status"],
+                        "type": detection,
+                        "agent": parsed["agent"],
+                    }
+
+                    if len(result["events"]) < MAX_SECURITY_EVENTS:
+                        result["events"].append(event)
+
+                    if len(vh["events"]) < MAX_SECURITY_EVENTS:
+                        vh["events"].append(event)
+
+        elif log_type == "error":
+            vh["error_files"].append(path)
+
+            for line in read_lines(path):
+                parsed = parse_error(line, server)
+                if not parsed:
+                    result["parse_failures"] += 1
+                    continue
+
+                result["errors"] += 1
+                vh["errors"] += 1
+                result["error_levels"][parsed["level"]] += 1
+
+                message = parsed["message"]
+                if len(message) > 500:
+                    message = message[:500] + "..."
+                result["error_messages"][message] += 1
+
+    result["score"] = security_score(
+        result["security"], result["status"]
+    )
+    result["risk"] = risk_level(result["score"])
+
+    for vh in result["vhosts"].values():
+        vh["score"] = security_score(
+            vh["security"], vh["status"]
+        )
+        vh["risk"] = risk_level(vh["score"])
+
+    return result
+
+
+def top_list(counter, limit=20):
+    return [[key, value] for key, value in counter.most_common(limit)]
+
+
+def serialize_server(data):
+    vhosts = []
+
+    for name, vh in sorted(data["vhosts"].items()):
+        vhosts.append({
+            "name": name,
+            "requests": vh["requests"],
+            "errors": vh["errors"],
+            "bytes": vh["bytes"],
+            "status": dict(vh["status"]),
+            "methods": top_list(vh["methods"], 10),
+            "ips": top_list(vh["ips"], 15),
+            "urls": top_list(vh["urls"], 15),
+            "security": dict(vh["security"]),
+            "score": vh["score"],
+            "risk": vh["risk"],
+            "access_files": [os.path.basename(x) for x in vh["access_files"]],
+            "error_files": [os.path.basename(x) for x in vh["error_files"]],
+            "events": vh["events"][:50],
+        })
+
+    return {
+        "server": data["server"],
+        "directory": data["directory"],
+        "files": data["files"],
+        "vhosts": vhosts,
+        "requests": data["requests"],
+        "errors": data["errors"],
+        "bytes": data["bytes"],
+        "status": dict(data["status"]),
+        "methods": top_list(data["methods"], 15),
+        "ips": top_list(data["ips"], 20),
+        "urls": top_list(data["urls"], 20),
+        "agents": top_list(data["agents"], 15),
+        "referers": top_list(data["referers"], 15),
+        "timeline": dict(data["timeline"]),
+        "security": dict(data["security"]),
+        "events": data["events"][:100],
+        "error_levels": top_list(data["error_levels"], 20),
+        "error_messages": top_list(data["error_messages"], 20),
+        "score": data["score"],
+        "risk": data["risk"],
+        "parse_failures": data["parse_failures"],
+    }
+
+
+def analyze_all():
+    servers = []
+    global_status = Counter()
+    global_methods = Counter()
+    global_ips = Counter()
+    global_urls = Counter()
+    global_agents = Counter()
+    global_referers = Counter()
+    global_timeline = Counter()
+    global_security = Counter()
+    global_levels = Counter()
+    global_errors = Counter()
+    global_events = []
+
+    total_requests = 0
+    total_errors = 0
+    total_bytes = 0
+    total_files = 0
+    total_parse_failures = 0
+
+    for server, directories in LOG_DIRS.items():
+        for directory in directories:
+            if not os.path.isdir(directory):
+                continue
+
+            files = discover_files(directory)
+            if not files:
+                continue
+
+            data = analyze_server(server, directory)
+
+            if not data["files"]:
+                continue
+
+            servers.append(serialize_server(data))
+            total_files += len(data["files"])
+            total_requests += data["requests"]
+            total_errors += data["errors"]
+            total_bytes += data["bytes"]
+            total_parse_failures += data["parse_failures"]
+
+            global_status.update(data["status"])
+            global_methods.update(data["methods"])
+            global_ips.update(data["ips"])
+            global_urls.update(data["urls"])
+            global_agents.update(data["agents"])
+            global_referers.update(data["referers"])
+            global_timeline.update(data["timeline"])
+            global_security.update(data["security"])
+            global_levels.update(data["error_levels"])
+            global_errors.update(data["error_messages"])
+
+            global_events.extend(data["events"])
+
+    score = security_score(global_security, global_status)
+
+    return {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "hostname": socket.gethostname(),
+        "requests": total_requests,
+        "errors": total_errors,
+        "bytes": total_bytes,
+        "files": total_files,
+        "parse_failures": total_parse_failures,
+        "status": dict(global_status),
+        "methods": top_list(global_methods, 15),
+        "ips": top_list(global_ips, 20),
+        "urls": top_list(global_urls, 20),
+        "agents": top_list(global_agents, 15),
+        "referers": top_list(global_referers, 15),
+        "timeline": dict(global_timeline),
+        "security": dict(global_security),
+        "events": global_events[:100],
+        "error_levels": top_list(global_levels, 20),
+        "error_messages": top_list(global_errors, 20),
+        "score": score,
+        "risk": risk_level(score),
+        "servers": servers,
+    }
+
+
+def print_detect():
+    print(f"\n{APP_NAME} {VERSION}")
+    print("=" * 72)
+
+    found = False
+
+    for server, directories in LOG_DIRS.items():
+        for directory in directories:
+            if not os.path.isdir(directory):
+                continue
+
+            print(f"\n[{server}] {directory}")
+
+            for path in discover_files(directory):
+                log_type = classify_file(path, server)
+                if log_type == "unknown":
+                    continue
+
+                found = True
+                vhost = vhost_from_filename(path)
+
+                try:
+                    size = human_bytes(os.path.getsize(path))
+                except OSError:
+                    size = "-"
+
+                print(
+                    f"  {log_type.upper():6} "
+                    f"{vhost:20} "
+                    f"{size:>10}  "
+                    f"{path}"
+                )
+
+    if not found:
+        print("\nTidak ada log yang berhasil dideteksi.")
+
+    print()
+
+
+def print_summary(data):
+    print(f"\n{APP_NAME} {VERSION}")
+    print("=" * 72)
+    print(f"Host          : {data['hostname']}")
+    print(f"Log files     : {data['files']}")
+    print(f"Requests      : {data['requests']:,}")
+    print(f"Errors        : {data['errors']:,}")
+    print(f"Traffic       : {human_bytes(data['bytes'])}")
+    print(f"Security      : {data['risk']} ({data['score']}/100)")
+    print()
+
+    status = data["status"]
+    for prefix in ("2", "3", "4", "5"):
+        total = sum(
+            value for code, value in status.items()
+            if code.startswith(prefix)
+        )
+        print(f"HTTP {prefix}xx      : {total:,}")
+
+    print("\nTop IP:")
+    for key, value in data["ips"][:10]:
+        print(f"  {value:8,}  {key}")
+
+    print("\nSecurity:")
+    if data["security"]:
+        for key, value in sorted(
+            data["security"].items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            print(f"  {value:8,}  {key}")
+    else:
+        print("  Tidak ada pola mencurigakan yang terdeteksi.")
+
+    print("\nVHost:")
+    for server in data["servers"]:
+        for vh in server["vhosts"]:
+            print(
+                f"  {server['server']:8} "
+                f"{vh['name']:20} "
+                f"{vh['requests']:10,} requests  "
+                f"{vh['risk']}"
+            )
+
+    print()
+
+
+HTML = r"""
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Server Log Intelligence</title>
+<style>
+:root {
+    color-scheme: dark;
+    --bg: #090d13;
+    --panel: #111823;
+    --panel2: #0d141e;
+    --border: #253041;
+    --text: #e7edf6;
+    --muted: #8793a7;
+    --accent: #58a6ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+    padding: 24px 28px;
+    border-bottom: 1px solid var(--border);
+    background: #0c1118;
+}
+header h1 { margin: 0; font-size: 24px; }
+header p { margin: 5px 0 0; color: var(--muted); }
+main { max-width: 1800px; margin: auto; padding: 24px; }
+.cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 14px;
+}
+.card, .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+}
+.card { padding: 18px; }
+.label { color: var(--muted); font-size: 12px; }
+.value { margin-top: 5px; font-size: 27px; font-weight: 700; }
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 16px;
+    margin-top: 16px;
+}
+.panel { padding: 18px; }
+.panel h2 { margin: 0 0 14px; font-size: 16px; }
+.chart { height: 270px; }
+canvas { width: 100%; height: 100%; }
+.vhosts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+}
+.vhost {
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+}
+.vhost h3 { margin: 0 0 8px; }
+.stat {
+    display: flex;
+    justify-content: space-between;
+    border-bottom: 1px solid #1e2734;
+    padding: 5px 0;
+    color: var(--muted);
+}
+.stat strong { color: var(--text); }
+.badge {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 20px;
+    font-size: 10px;
+    font-weight: 700;
+}
+.NORMAL { color: var(--good); background: #10251a; }
+.LOW { color: #d2b14c; background: #28220f; }
+.MEDIUM { color: #e3a14a; background: #2c1e0c; }
+.HIGH, .CRITICAL { color: var(--danger); background: #2b1212; }
+table { width: 100%; border-collapse: collapse; }
+th, td {
+    padding: 8px;
+    border-bottom: 1px solid #202a38;
+    text-align: left;
+    vertical-align: top;
+}
+th { color: var(--muted); font-weight: 500; }
+pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--muted);
+}
+.event {
+    padding: 10px 0;
+    border-bottom: 1px solid #202a38;
+}
+.event strong { color: var(--danger); }
+.event small { display: block; color: var(--muted); margin-top: 3px; }
+footer {
+    text-align: center;
+    color: var(--muted);
+    padding: 24px;
+}
+@media (max-width: 700px) {
+    main { padding: 14px; }
+    .grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+<h1>Web Server Log Intelligence</h1>
+<p id="subtitle">Loading...</p>
+</header>
+
+<main>
+<section class="cards">
+<div class="card"><div class="label">Total Requests</div><div class="value" id="requests">0</div></div>
+<div class="card"><div class="label">HTTP 2xx</div><div class="value" id="s2xx">0</div></div>
+<div class="card"><div class="label">HTTP 3xx</div><div class="value" id="s3xx">0</div></div>
+<div class="card"><div class="label">HTTP 4xx</div><div class="value" id="s4xx">0</div></div>
+<div class="card"><div class="label">HTTP 5xx</div><div class="value" id="s5xx">0</div></div>
+<div class="card"><div class="label">Error Log</div><div class="value" id="errors">0</div></div>
+<div class="card"><div class="label">Traffic</div><div class="value" id="traffic">0 B</div></div>
+<div class="card"><div class="label">Security Risk</div><div class="value" id="risk">NORMAL</div></div>
+</section>
+
+<section class="grid">
+<div class="panel">
+<h2>Request Timeline</h2>
+<div class="chart"><canvas id="timeline"></canvas></div>
+</div>
+<div class="panel">
+<h2>HTTP Status</h2>
+<div class="chart"><canvas id="status"></canvas></div>
+</div>
+<div class="panel">
+<h2>HTTP Methods</h2>
+<div class="chart"><canvas id="methods"></canvas></div>
+</div>
+<div class="panel">
+<h2>Security Detection</h2>
+<div class="chart"><canvas id="security"></canvas></div>
+</div>
+</section>
+
+<section class="panel" style="margin-top:16px">
+<h2>VirtualHost / Server Block</h2>
+<div class="vhosts" id="vhosts"></div>
+</section>
+
+<section class="grid">
+<div class="panel"><h2>Top IP Address</h2><table id="ips"><tbody></tbody></table></div>
+<div class="panel"><h2>Top URL</h2><table id="urls"><tbody></tbody></table></div>
+<div class="panel"><h2>Top User-Agent</h2><table id="agents"><tbody></tbody></table></div>
+<div class="panel"><h2>Error Levels</h2><table id="levels"><tbody></tbody></table></div>
+</section>
+
+<section class="panel" style="margin-top:16px">
+<h2>Security Events</h2>
+<div id="events">No security event.</div>
+</section>
+
+<section class="panel" style="margin-top:16px">
+<h2>Detected Log Files</h2>
+<div id="files"></div>
+</section>
+
+<section class="panel" style="margin-top:16px">
+<h2>Frequent Error Messages</h2>
+<table id="errorMessages"><tbody></tbody></table>
+</section>
+</main>
+
+<footer>
+Last update: <span id="updated">-</span> · Auto refresh: 15 seconds
+</footer>
+
+<script>
+let charts = {};
+
+function n(v) {
+    return new Intl.NumberFormat("id-ID").format(v || 0);
+}
+function bytes(v) {
+    let x = Number(v || 0);
+    const units = ["B","KB","MB","GB","TB"];
+    let i = 0;
+    while (x >= 1024 && i < units.length - 1) {
+        x /= 1024; i++;
+    }
+    return x.toFixed(1) + " " + units[i];
+}
+function esc(v) {
+    const d = document.createElement("div");
+    d.textContent = v == null ? "" : String(v);
+    return d.innerHTML;
+}
+function draw(id, type, labels, values) {
+    const c = document.getElementById(id);
+    const ctx = c.getContext("2d");
+    if (charts[id]) charts[id].remove();
+    const w = c.width = c.clientWidth * devicePixelRatio;
+    const h = c.height = c.clientHeight * devicePixelRatio;
+    ctx.scale(devicePixelRatio, devicePixelRatio);
+    const width = c.clientWidth, height = c.clientHeight;
+    const max = Math.max(...values, 1);
+
+    ctx.clearRect(0, 0, width, height);
+    ctx.font = "11px system-ui";
+    ctx.fillStyle = "#8793a7";
+    ctx.strokeStyle = "#253041";
+    ctx.lineWidth = 1;
+
+    if (type === "line" || type === "bar") {
+        const left = 42, bottom = 30, top = 10;
+        const chartW = width - left - 10;
+        const chartH = height - bottom - top;
+        ctx.beginPath();
+        ctx.moveTo(left, top);
+        ctx.lineTo(left, top + chartH);
+        ctx.lineTo(width - 10, top + chartH);
+        ctx.stroke();
+
+        const count = Math.max(values.length, 1);
+        values.forEach((v, i) => {
+            const x = left + (i / Math.max(count - 1, 1)) * chartW;
+            const y = top + chartH - (v / max) * chartH;
+            if (type === "bar") {
+                const bw = Math.max(3, chartW / count * 0.7);
+                ctx.fillStyle = "#58a6ff";
+                ctx.fillRect(x - bw / 2, y, bw, top + chartH - y);
+            } else {
+                ctx.fillStyle = "#58a6ff";
+                ctx.beginPath();
+                ctx.arc(x, y, 2, 0, Math.PI * 2);
+                ctx.fill();
+                if (i > 0) {
+                    const pv = values[i - 1];
+                    const px = left + ((i - 1) / Math.max(count - 1, 1)) * chartW;
+                    const py = top + chartH - (pv / max) * chartH;
+                    ctx.strokeStyle = "#58a6ff";
+                    ctx.beginPath();
+                    ctx.moveTo(px, py);
+                    ctx.lineTo(x, y);
+                    ctx.stroke();
+                }
+            }
+        });
+
+        if (labels.length) {
+            ctx.fillStyle = "#8793a7";
+            const step = Math.max(1, Math.ceil(labels.length / 6));
+            labels.forEach((label, i) => {
+                if (i % step === 0) {
+                    const x = left + (i / Math.max(count - 1, 1)) * chartW;
+                    ctx.fillText(label.slice(0, 16), Math.max(left, x - 30), height - 8);
+                }
+            });
+        }
+        charts[id] = {remove: () => {}};
+        return;
+    }
+
+    const total = values.reduce((a,b) => a+b, 0) || 1;
+    const cx = width / 2, cy = height / 2, radius = Math.min(width,height) * .32;
+    let angle = -Math.PI / 2;
+    const palette = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#79c0ff","#ffa657","#56d364"];
+
+    values.forEach((v, i) => {
+        const next = angle + (v / total) * Math.PI * 2;
+        ctx.fillStyle = palette[i % palette.length];
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.arc(cx, cy, radius, angle, next);
+        ctx.closePath();
+        ctx.fill();
+        angle = next;
+    });
+
+    ctx.fillStyle = "#111823";
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * .55, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#e7edf6";
+    ctx.textAlign = "center";
+    ctx.font = "bold 16px system-ui";
+    ctx.fillText(n(total), cx, cy + 5);
+    ctx.textAlign = "left";
+    charts[id] = {remove: () => {}};
+}
+
+function table(id, data) {
+    const body = document.querySelector("#" + id + " tbody");
+    body.innerHTML = data.map(x =>
+        `<tr><td>${esc(x[0])}</td><td>${n(x[1])}</td></tr>`
+    ).join("");
+}
+
+function statusTotals(status) {
+    const result = {2:0,3:0,4:0,5:0};
+    Object.entries(status).forEach(([code,count]) => {
+        const p = code.charAt(0);
+        if (result[p] !== undefined) result[p] += count;
+    });
+    return result;
+}
+
+function renderVhosts(servers) {
+    const box = document.getElementById("vhosts");
+    let out = "";
+    servers.forEach(server => {
+        server.vhosts.forEach(v => {
+            out += `
+            <div class="vhost">
+                <h3>${esc(v.name)}</h3>
+                <span class="badge ${esc(v.risk)}">${esc(v.risk)}</span>
+                <div class="stat"><span>Server</span><strong>${esc(server.server)}</strong></div>
+                <div class="stat"><span>Requests</span><strong>${n(v.requests)}</strong></div>
+                <div class="stat"><span>Errors</span><strong>${n(v.errors)}</strong></div>
+                <div class="stat"><span>Traffic</span><strong>${bytes(v.bytes)}</strong></div>
+                <div class="stat"><span>Score</span><strong>${v.score}/100</strong></div>
+                <div style="margin-top:8px;color:#8793a7;font-size:11px">
+                    ${v.access_files.map(x => "ACCESS · " + esc(x)).join("<br>")}
+                    ${v.error_files.map(x => "ERROR · " + esc(x)).join("<br>")}
+                </div>
+            </div>`;
+        });
+    });
+    box.innerHTML = out || "<p>Tidak ada VHost terdeteksi.</p>";
+}
+
+function renderFiles(servers) {
+    const box = document.getElementById("files");
+    let out = "";
+    servers.forEach(s => s.files.forEach(f => {
+        out += `<div class="event">
+            <strong>${esc(s.server)}</strong> · ${esc(f.type)}
+            · ${esc(f.vhost)} · ${bytes(f.size)}
+            <small>${esc(f.path)} · ${esc(f.modified)}</small>
+        </div>`;
+    }));
+    box.innerHTML = out || "Tidak ada file log terdeteksi.";
+}
+
+function renderEvents(events) {
+    const box = document.getElementById("events");
+    if (!events.length) {
+        box.textContent = "Tidak ada pola aktivitas mencurigakan yang terdeteksi.";
+        return;
+    }
+    box.innerHTML = events.map(e => `
+        <div class="event">
+            <strong>${esc(e.type)}</strong>
+            · ${esc(e.ip)}
+            · HTTP ${e.status}
+            · VHost ${esc(e.vhost)}
+            <small>${esc(e.method)} ${esc(e.url)}</small>
+            <small>Source: ${esc(e.source)}</small>
+            <small>${esc(e.agent)}</small>
+        </div>
+    `).join("");
+}
+
+async function update() {
+    try {
+        const response = await fetch("/api/data", {cache:"no-store"});
+        const d = await response.json();
+
+        document.getElementById("subtitle").textContent =
+            `${d.hostname} · ${d.servers.length} web server instance · ${d.files} log files`;
+
+        document.getElementById("requests").textContent = n(d.requests);
+        document.getElementById("errors").textContent = n(d.errors);
+        document.getElementById("traffic").textContent = bytes(d.bytes);
+        document.getElementById("risk").textContent = d.risk;
+
+        const s = statusTotals(d.status);
+        document.getElementById("s2xx").textContent = n(s[2]);
+        document.getElementById("s3xx").textContent = n(s[3]);
+        document.getElementById("s4xx").textContent = n(s[4]);
+        document.getElementById("s5xx").textContent = n(s[5]);
+
+        const timeline = Object.entries(d.timeline).sort();
+        draw("timeline", "line", timeline.map(x=>x[0]), timeline.map(x=>x[1]));
+
+        const status = Object.entries(d.status).sort();
+        draw("status", "doughnut", status.map(x=>x[0]), status.map(x=>x[1]));
+
+        draw("methods", "doughnut", d.methods.map(x=>x[0]), d.methods.map(x=>x[1]));
+
+        const security = Object.entries(d.security).sort((a,b)=>b[1]-a[1]);
+        draw("security", "bar", security.map(x=>x[0]), security.map(x=>x[1]));
+
+        table("ips", d.ips);
+        table("urls", d.urls);
+        table("agents", d.agents);
+        table("levels", d.error_levels);
+        table("errorMessages", d.error_messages);
+
+        renderVhosts(d.servers);
+        renderFiles(d.servers);
+        renderEvents(d.events);
+
+        document.getElementById("updated").textContent = d.generated_at;
+    } catch (error) {
+        console.error(error);
+    }
+}
+
+update();
+setInterval(update, 15000);
+window.addEventListener("resize", update);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def send_text(self, body, content_type="text/html; charset=utf-8", status=200):
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
+            self.send_text(HTML)
+            return
+
+        if parsed.path == "/api/data":
+            data = analyze_all()
+            self.send_text(
+                json.dumps(data, ensure_ascii=False),
+                "application/json; charset=utf-8",
+            )
+            return
+
+        if parsed.path == "/health":
+            self.send_text(
+                json.dumps({"status": "ok", "version": VERSION}),
+                "application/json; charset=utf-8",
+            )
+            return
+
+        self.send_text("Not Found", "text/plain; charset=utf-8", 404)
+
+
+SERVER = None
+
+
+def stop_server(signum=None, frame=None):
+    global SERVER
+    if SERVER:
+        print("\nStopping mon-log...")
+        threading.Thread(
+            target=SERVER.shutdown,
+            daemon=True
+        ).start()
+
+
+def run_server(port):
+    global SERVER
+
+    try:
+        SERVER = ThreadingHTTPServer((HOST, port), Handler)
+    except OSError as exc:
+        eprint(f"Gagal membuka port {port}: {exc}")
+        eprint("Gunakan port lain dengan: mon-log --port 9090")
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, stop_server)
+    signal.signal(signal.SIGTERM, stop_server)
+
+    print(f"\n{APP_NAME} {VERSION}")
+    print("=" * 72)
+    print(f"Dashboard : http://{HOST}:{port}")
+    print(f"Hostname  : {socket.gethostname()}")
+    print("Mode      : foreground")
+    print("Refresh   : 15 seconds")
+    print()
+    print("Tekan CTRL+C untuk berhenti.")
+    print("=" * 72)
+
+    try:
+        SERVER.serve_forever()
+    finally:
+        SERVER.server_close()
+        SERVER = None
+        print("Stopped.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Web Server Log Intelligence - Apache2/Nginx"
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=PORT,
+        help=f"Port dashboard (default: {PORT})",
+    )
+
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Tampilkan ringkasan di terminal dan keluar.",
+    )
+
+    parser.add_argument(
+        "--detect",
+        action="store_true",
+        help="Tampilkan file log yang berhasil dideteksi dan keluar.",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+
+    args = parser.parse_args()
+
+    if args.detect:
+        print_detect()
+        return
+
+    if args.summary:
+        print_summary(analyze_all())
+        return
+
+    run_server(args.port)
+
+
+if __name__ == "__main__":
+    main()
