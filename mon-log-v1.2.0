@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# Web Server Log Intelligence 1.0.0
+# Standalone: Python 3 Standard Library only. No Flask, pip, venv or daemon.
+
+import os, re, sys, time, json, socket, signal, threading
+from pathlib import Path
+from collections import Counter, defaultdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+from datetime import datetime
+
+VERSION="1.2.0"; HOST="0.0.0.0"; PORT=8080; REFRESH=15
+ROOTS=[Path("/var/log/apache2"),Path("/var/log/nginx"),Path("/var/log/httpd")]
+ACCESS_RE=re.compile(r"(^|[-_.])(access|request|requests)([-_.]|$)",re.I)
+ERROR_RE=re.compile(r"(^|[-_.])(error|errors|err)([-_.]|$)",re.I)
+REQ_RE=re.compile(r'"([A-Z]+)\s+(\S+)(?:\s+HTTP/[0-9.]+)?"')
+STATUS_RE=re.compile(r'"\s+(\d{3})\s+')
+APACHE_RE=re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<method>[A-Z]+)\s+(?P<path>\S+)(?:\s+[^"]*)?"\s+(?P<status>\d{3})\s+(?P<size>\S+)')
+DOMAIN_RE=re.compile(r'\b(?:www\.)?[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}\b')
+lock=threading.Lock(); latest={}; history=[]; running=True; httpd=None
+
+def get_ip():
+    candidates=[]
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(.3)
+        s.connect(("8.8.8.8",80)); candidates.append(s.getsockname()[0]); s.close()
+    except Exception: pass
+    try: candidates.append(socket.gethostbyname(socket.gethostname()))
+    except Exception: pass
+    for ip in candidates:
+        if ip and not ip.startswith("127."): return ip
+    return "127.0.0.1"
+
+def human_bytes(n):
+    n=float(n); units=["B","KB","MB","GB","TB"]
+    for u in units:
+        if n<1024 or u=="TB": return f"{n:.1f} {u}" if u!="B" else f"{int(n)} B"
+        n/=1024
+
+def classify(p):
+    n=p.name.lower()
+    if ERROR_RE.search(n): return "error"
+    if ACCESS_RE.search(n): return "access"
+    try:
+        with p.open("r",errors="replace") as f:
+            for _ in range(30):
+                line=f.readline()
+                if not line: break
+                if REQ_RE.search(line) and STATUS_RE.search(line): return "access"
+                if re.search(r"\[(emerg|alert|crit|error|warn)",line,re.I): return "error"
+    except (OSError,PermissionError): pass
+    return None
+
+def discover():
+    out=[]; seen=set()
+    for root in ROOTS:
+        if not root.is_dir(): continue
+        try:
+            for p in root.iterdir():
+                key=str(p)
+                if not p.is_file() or key in seen: continue
+                kind=classify(p)
+                if kind: out.append((p,kind)); seen.add(key)
+        except (OSError,PermissionError): pass
+    return sorted(out,key=lambda x:str(x[0]))
+
+def domain_from_file(p):
+    stem=re.sub(r"\.(?:log|txt)(?:\.\d+)?(?:\.gz)?$","",p.name,flags=re.I)
+    stem=re.sub(r"[-_.](?:access|error|err|request|requests)$","",stem,flags=re.I)
+    if "." in stem and re.fullmatch(r"[A-Za-z0-9.-]+",stem): return stem.strip("._-")
+    try:
+        with p.open("r",errors="replace") as f: text="".join(f.readlines()[-100:])
+        for d in DOMAIN_RE.findall(text):
+            if d.lower() not in ("example.com","localhost"): return d
+    except Exception: pass
+    return "-"
+
+def parse_access(line):
+    m=APACHE_RE.search(line)
+    if m:
+        size=m.group("size")
+        return m.group("ip"),m.group("method"),m.group("path"),int(m.group("status")),int(size) if size.isdigit() else 0
+    r,s=REQ_RE.search(line),STATUS_RE.search(line)
+    if r and s:
+        ip=re.match(r"\S+",line)
+        return ip.group(0) if ip else "-",r.group(1),r.group(2),int(s.group(1)),0
+    return None
+
+def analyze(p,kind):
+    d={"file":str(p),"name":p.name,"kind":kind,"domain":domain_from_file(p),"lines":0,"hits":0,"errors":0,"bytes":0,"statuses":Counter(),"methods":Counter(),"paths":Counter(),"ips":Counter()}
+    try:
+        with p.open("r",errors="replace") as f:
+            for line in f:
+                d["lines"]+=1
+                if kind=="access":
+                    x=parse_access(line)
+                    if x:
+                        ip,method,path,status,size=x; d["hits"]+=1; d["bytes"]+=size
+                        d["statuses"][str(status)]+=1; d["methods"][method]+=1; d["paths"][path]+=1
+                        if ip!="-": d["ips"][ip]+=1
+                elif re.search(r"\b(error|crit|alert|emerg|warn)\b",line,re.I): d["errors"]+=1
+    except (OSError,PermissionError): pass
+    for k in ("statuses","methods","paths","ips"): d[k]=dict(d[k].most_common(20))
+    return d
+
+def make_snapshot():
+    files=[analyze(p,k) for p,k in discover()]
+    access=[x for x in files if x["kind"]=="access"]; errors=[x for x in files if x["kind"]=="error"]
+    statuses=Counter(); methods=Counter(); paths=Counter(); ips=Counter(); domains=defaultdict(lambda:{"access":0,"errors":0,"files":0}); traffic=0
+    for x in access:
+        statuses.update(x["statuses"]); methods.update(x["methods"]); paths.update(x["paths"]); ips.update(x["ips"]); traffic+=x["bytes"]
+        if x["domain"]!="-": domains[x["domain"]]["access"]+=x["hits"]; domains[x["domain"]]["files"]+=1
+    for x in errors:
+        if x["domain"]!="-": domains[x["domain"]]["errors"]+=x["errors"]; domains[x["domain"]]["files"]+=1
+    ip=get_ip()
+    return {"version":VERSION,"generated_at":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"server_ip":ip,
+            "hostname":socket.gethostname(),"dashboard_url":f"http://{ip}:{PORT}","refresh_seconds":REFRESH,
+            "summary":{"hits":sum(x["hits"] for x in access),"errors":sum(x["errors"] for x in errors),
+                       "log_files":len(files),"access_files":len(access),"error_files":len(errors),
+                       "unique_ips":len(ips),"unique_paths":len(paths),"domains":len(domains),"traffic":human_bytes(traffic)},
+            "statuses":dict(sorted(statuses.items())),"methods":dict(methods.most_common(15)),
+            "top_paths":dict(paths.most_common(15)),"top_ips":dict(ips.most_common(15)),
+            "domains":dict(sorted(domains.items())),"files":files}
+
+def add_history(d):
+    global history
+    s=d["summary"]
+    point={
+        "time":datetime.now().strftime("%H:%M:%S"),
+        "hits":s["hits"],
+        "errors":s["errors"],
+        "ips":s["unique_ips"]
+    }
+    with lock:
+        history.append(point)
+        history=history[-120:]
+
+
+def show_console(d):
+    os.system("clear" if os.name!="nt" else "cls"); s=d["summary"]
+    domain=", ".join(d["domains"]) if d["domains"] else "Auto / Multiple / Not detected"
+    print(f"Web Server Log Intelligence {VERSION}")
+    print("="*72)
+    print(f"Dashboard : http://{d['server_ip']}:{PORT}")
+    print(f"Hostname  : {d['hostname']}")
+    print(f"Domain    : {domain}")
+    print("Mode      : foreground"); print(f"Refresh   : {REFRESH} seconds"); print("="*72)
+    print("\nSTATISTICS"); print("-"*72)
+    for label,key in [("Total Hit","hits"),("Access Log","access_files"),("Error","errors"),("Error Log","error_files"),("Log Detected","log_files"),("Unique IP","unique_ips"),("Unique URL","unique_paths"),("Traffic","traffic"),("Domain","domains")]:
+        print(f"{label:<17}: {s[key]:,}" if isinstance(s[key],int) else f"{label:<17}: {s[key]}")
+    print("\nHTTP STATUS"); print("-"*72)
+    for code,count in d["statuses"].items(): print(f"{code:>4}  {count:>10,}")
+    print("\nTOP DOMAINS"); print("-"*72)
+    for name,v in d["domains"].items(): print(f"{name:<40} access={v['access']:,} errors={v['errors']:,}")
+    print("\nTOP REQUEST PATHS"); print("-"*72)
+    for path,count in d["top_paths"].items(): print(f"{count:>10,}  {path[:58]}")
+    print("\nDETECTED LOG FILES"); print("-"*72)
+    for x in d["files"]: print(f"{x['kind']:<6} {x['file']}  domain={x['domain']}")
+    print(f"\nLast update: {d['generated_at']} | CTRL+C to stop")
+
+HTML=r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Web Server Log Intelligence</title>
+<style>
+:root{
+ --bg:#05090e;--panel:#0b121a;--panel2:#0e1721;--line:#1d2a37;
+ --text:#eaf2f8;--muted:#8193a5;--blue:#31a8ff;--cyan:#35d7ff;
+ --green:#27d17f;--yellow:#ffc44d;--red:#ff5364;--orange:#ff8c42;
+}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at 80% 0%,rgba(32,110,170,.15),transparent 32%),linear-gradient(135deg,#04080c,#091019 52%,#05090e);color:var(--text);font:13px Arial,Helvetica,sans-serif;min-height:100vh}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(rgba(255,255,255,.015) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.012) 1px,transparent 1px);background-size:32px 32px;mask-image:linear-gradient(to bottom,black,transparent 85%)}
+header{position:sticky;top:0;z-index:10;padding:17px 24px;background:rgba(5,9,14,.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.head{max-width:1550px;margin:auto;display:flex;justify-content:space-between;align-items:center;gap:20px}
+.brand{display:flex;align-items:center;gap:12px}.brandmark{width:38px;height:38px;border-radius:10px;border:1px solid #24445b;background:linear-gradient(145deg,#102638,#081018);display:grid;place-items:center;color:var(--cyan);font-weight:bold;box-shadow:0 0 22px rgba(49,168,255,.12)}
+h1{font-size:20px;margin:0;letter-spacing:.2px}.subtitle{color:var(--muted);margin-top:4px;font-size:11px}
+.live{display:flex;align-items:center;gap:8px;color:#a9bac9;font-size:11px;text-transform:uppercase}.pulse{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green);animation:pulse 1.5s infinite}
+@keyframes pulse{50%{opacity:.35;transform:scale(.75)}}
+main{max-width:1550px;margin:auto;padding:20px 24px 35px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.card{background:linear-gradient(145deg,rgba(15,24,34,.97),rgba(7,13,20,.97));border:1px solid var(--line);border-radius:9px;padding:15px;box-shadow:0 10px 30px rgba(0,0,0,.22);overflow:hidden;position:relative}
+.card:after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:9px;box-shadow:inset 0 1px rgba(255,255,255,.035)}
+.kpi{min-height:100px}.label{font-size:9px;color:#7e92a5;text-transform:uppercase;letter-spacing:1px}.value{font-size:25px;font-weight:700;margin:9px 0 5px;letter-spacing:.3px}.delta{font-size:10px;color:var(--green)}.delta.warn{color:var(--yellow)}
+.section{margin-top:12px}.two{display:grid;grid-template-columns:1.08fr .92fr;gap:12px}.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.cardtitle{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}h2,h3{font-size:12px;margin:0;text-transform:uppercase;letter-spacing:.8px}.badge{font-size:9px;color:#92a5b7;border:1px solid var(--line);border-radius:20px;padding:4px 7px}
+.chart{height:235px;position:relative}.chart svg{width:100%;height:100%}.legend{display:flex;gap:18px;color:#91a3b5;font-size:10px;margin:4px 0 6px}.legend span:before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;background:currentColor}.legend .hits{color:var(--blue)}.legend .errors{color:var(--red)}
+.donutbox{display:flex;align-items:center;justify-content:center;gap:28px;height:235px}.donut{width:168px;height:168px;border-radius:50%;position:relative;display:grid;place-items:center;background:conic-gradient(var(--green) 0 72%,var(--cyan) 72% 81%,var(--orange) 81% 95%,var(--red) 95% 100%);box-shadow:0 0 28px rgba(39,209,127,.08)}.donut:after{content:"";width:105px;height:105px;background:#0b121a;border-radius:50%;position:absolute}.donutcenter{position:absolute;z-index:2;text-align:center}.donutcenter b{font-size:20px}.donutcenter span{display:block;color:var(--muted);font-size:9px;margin-top:3px}
+.legendlist{min-width:150px}.legendrow{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:7px 0;border-bottom:1px solid var(--line);font-size:10px}.dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:7px}.ok{background:var(--green)}.info{background:var(--cyan)}.warnc{background:var(--orange)}.bad{background:var(--red)}
+.barlist{display:flex;flex-direction:column;gap:9px}.barrow{display:grid;grid-template-columns:90px 1fr 48px;align-items:center;gap:8px;font-size:10px}.barbg{height:7px;background:#17232f;border-radius:5px;overflow:hidden}.barfill{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:5px}.value-sm{text-align:right;color:#a8b8c6}
+.row{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:10px}.row span:first-child{color:#b4c1cc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.row b{color:#e5edf3}.scroll{max-height:245px;overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:10px}th,td{padding:8px 7px;border-bottom:1px solid var(--line);text-align:left}th{color:#718598;font-size:9px;text-transform:uppercase;letter-spacing:.7px}td{color:#bdc9d3}
+.status-high{color:var(--red);font-weight:bold}.status-medium{color:var(--yellow);font-weight:bold}.status-low{color:var(--green);font-weight:bold}.footer{color:#66798b;font-size:10px;text-align:right;margin-top:10px}
+@media(max-width:1100px){.grid{grid-template-columns:repeat(2,1fr)}.two,.three{grid-template-columns:1fr}}
+@media(max-width:650px){.grid{grid-template-columns:1fr}main{padding:12px}.head{align-items:flex-start}.live{display:none}.donutbox{gap:12px}.legendlist{min-width:125px}}
+</style>
+</head>
+<body>
+<header><div class="head">
+<div class="brand"><div class="brandmark">↯</div><div><h1>Web Server Log Intelligence <span id="ver"></span></h1><div class="subtitle">Apache2 / Nginx • automatic log detection • VHost analytics</div></div></div>
+<div class="live"><span class="pulse"></span> Live monitoring</div>
+</div></header>
+<main>
+<div class="grid">
+<div class="card kpi"><div class="label">Total Hit</div><div class="value" id="hits">0</div><div class="delta">↗ Request volume</div></div>
+<div class="card kpi"><div class="label">Total Error</div><div class="value" id="errors">0</div><div class="delta warn">⚠ Server/application errors</div></div>
+<div class="card kpi"><div class="label">Access Log</div><div class="value" id="af">0</div><div class="delta">● Files detected</div></div>
+<div class="card kpi"><div class="label">Traffic</div><div class="value" id="traffic">0</div><div class="delta">↗ Processed log traffic</div></div>
+</div>
+<div class="grid section">
+<div class="card kpi"><div class="label">Unique Client IP</div><div class="value" id="ips">0</div><div class="delta">Distinct sources</div></div>
+<div class="card kpi"><div class="label">Unique URL</div><div class="value" id="urls">0</div><div class="delta">Request paths</div></div>
+<div class="card kpi"><div class="label">Domains / VHost</div><div class="value" id="domains">0</div><div class="delta">Automatically detected</div></div>
+<div class="card kpi"><div class="label">Error Log</div><div class="value" id="ef">0</div><div class="delta warn">● Files detected</div></div>
+</div>
+<div class="two section">
+<div class="card"><div class="cardtitle"><h2>Request Trend</h2><span class="badge">LIVE • 120 samples</span></div><div class="legend"><span class="hits">Hits</span><span class="errors">Errors</span></div><div class="chart"><svg id="trend" viewBox="0 0 900 245" preserveAspectRatio="none"></svg></div></div>
+<div class="card"><div class="cardtitle"><h2>HTTP Status Distribution</h2><span class="badge">All access logs</span></div><div class="donutbox"><div class="donut" id="donut"><div class="donutcenter"><b id="statusTotal">0</b><span>responses</span></div></div><div class="legendlist" id="statusLegend"></div></div></div>
+</div>
+<div class="three section">
+<div class="card"><div class="cardtitle"><h2>Top Request Path</h2></div><div class="scroll" id="paths"></div></div>
+<div class="card"><div class="cardtitle"><h2>Top Client IP</h2></div><div class="scroll" id="iplist"></div></div>
+<div class="card"><div class="cardtitle"><h2>HTTP Method</h2></div><div class="barlist" id="methods"></div></div>
+</div>
+<div class="card section"><div class="cardtitle"><h2>Domain / VHost Statistics</h2><span class="badge">Access + Error + Traffic</span></div><div class="scroll"><table><thead><tr><th>Domain / VHost</th><th>Hits</th><th>Errors</th><th>Traffic</th><th>Status</th></tr></thead><tbody id="domainTable"></tbody></table></div></div>
+<div class="card section"><div class="cardtitle"><h2>Detected Log Files</h2><span class="badge" id="logBadge">0 files</span></div><div class="scroll"><table><thead><tr><th>Type</th><th>Log File</th><th>Domain</th><th>Hits</th><th>Errors</th></tr></thead><tbody id="files"></tbody></table></div></div>
+<div class="footer">Server: <span id="server">-</span> • Last update: <span id="updated">-</span> • Auto refresh: 15 seconds</div>
+</main>
+<script>
+const E=s=>String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+const F=n=>Number(n||0).toLocaleString();
+function list(o){return Object.entries(o||{}).map(([k,v])=>`<div class="row"><span>${E(k)}</span><b>${F(v)}</b></div>`).join('')||'<span style="color:#718598">No data</span>'}
+function drawTrend(h){
+ const svg=document.getElementById("trend");if(!h.length){svg.innerHTML="";return}
+ const W=900,H=245,p=28,max=Math.max(1,...h.map(x=>Math.max(x.hits,x.errors)));
+ const line=k=>h.map((x,i)=>{const X=p+i*(W-2*p)/Math.max(1,h.length-1),Y=H-p-(x[k]/max)*(H-2*p);return X+","+Y}).join(" ");
+ let grid="";for(let i=1;i<=4;i++){let y=H-p-(i/4)*(H-2*p);grid+=`<line x1="${p}" y1="${y}" x2="${W-p}" y2="${y}" stroke="#182532"/><text x="4" y="${y+3}" fill="#607487" font-size="9">${F(Math.round(max*i/4))}</text>`}
+ svg.innerHTML=grid+`<polyline fill="none" stroke="#31a8ff" stroke-width="3" points="${line("hits")}"/><polyline fill="none" stroke="#ff5364" stroke-width="2.5" points="${line("errors")}"/><text x="${p}" y="${H-5}" fill="#607487" font-size="9">${E(h[0].time)}</text><text x="${W-p}" y="${H-5}" text-anchor="end" fill="#607487" font-size="9">${E(h[h.length-1].time)}</text>`;
+}
+function drawStatus(o){
+ const entries=Object.entries(o||{}).sort((a,b)=>Number(b[0])-Number(a[0]));const total=entries.reduce((a,x)=>a+x[1],0);
+ document.getElementById("statusTotal").textContent=F(total);
+ const colors=["#27d17f","#35d7ff","#ff8c42","#ff5364"];let acc=0,stops=[];
+ entries.forEach((x,i)=>{let pct=total?x[1]/total*100:0;stops.push(`${colors[i%4]} ${acc}% ${acc+pct}%`);acc+=pct});
+ document.getElementById("donut").style.background=`conic-gradient(${stops.join(",")||"#17232f 0 100%"})`;
+ document.getElementById("statusLegend").innerHTML=entries.slice(0,6).map((x,i)=>{let pct=total?(x[1]/total*100).toFixed(1):0;return `<div class="legendrow"><span><i class="dot ${["ok","info","warnc","bad"][i%4]}"></i>${E(x[0])}</span><b>${F(x[1])} <small style="color:#718598">${pct}%</small></b></div>`}).join('');
+}
+function drawMethods(o){
+ const a=Object.entries(o||{}).slice(0,7),max=Math.max(...a.map(x=>x[1]),1);
+ document.getElementById("methods").innerHTML=a.map(([k,v])=>`<div class="barrow"><span>${E(k)}</span><div class="barbg"><div class="barfill" style="width:${v/max*100}%"></div></div><span class="value-sm">${F(v)}</span></div>`).join('')||'<span style="color:#718598">No data</span>';
+}
+function drawDomains(d){
+ const rows=Object.entries(d||{}).map(([name,v])=>{const status=v.errors>100?'HIGH':v.errors>20?'MEDIUM':'LOW';const cls=status==='HIGH'?'status-high':status==='MEDIUM'?'status-medium':'status-low';return `<tr><td>${E(name)}</td><td>${F(v.access)}</td><td>${F(v.errors)}</td><td>-</td><td class="${cls}">${status}</td></tr>`});
+ document.getElementById("domainTable").innerHTML=rows.join('')||'<tr><td colspan="5">No domain detected</td></tr>';
+}
+async function load(){
+ try{
+  const d=await(await fetch('/api/stats',{cache:'no-store'})).json(),s=d.summary;
+  document.getElementById('ver').textContent=d.version;document.getElementById('hits').textContent=F(s.hits);document.getElementById('errors').textContent=F(s.errors);
+  document.getElementById('af').textContent=F(s.access_files);document.getElementById('ef').textContent=F(s.error_files);document.getElementById('traffic').textContent=s.traffic;
+  document.getElementById('ips').textContent=F(s.unique_ips);document.getElementById('urls').textContent=F(s.unique_paths);document.getElementById('domains').textContent=F(s.domains);
+  document.getElementById('server').textContent=d.server_ip;document.getElementById('updated').textContent=d.generated_at;document.getElementById('logBadge').textContent=F(s.log_files)+' files';
+  document.getElementById('paths').innerHTML=list(d.top_paths);document.getElementById('iplist').innerHTML=list(d.top_ips);
+  drawTrend(d.history||[]);drawStatus(d.statuses);drawMethods(d.methods);drawDomains(d.domains);
+  document.getElementById('files').innerHTML=d.files.map(x=>`<tr><td>${E(x.kind)}</td><td>${E(x.file)}</td><td>${E(x.domain)}</td><td>${F(x.hits)}</td><td>${F(x.errors)}</td></tr>`).join('');
+ }catch(e){document.getElementById('updated').textContent='connection error'}
+}
+load();setInterval(load,15000);
+</script>
+</body></html>'''
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,*args): pass
+    def send_data(self,data,ctype="text/html; charset=utf-8",code=200):
+        data=data.encode() if isinstance(data,str) else data; self.send_response(code)
+        self.send_header("Content-Type",ctype); self.send_header("Content-Length",str(len(data))); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(data)
+    def do_GET(self):
+        path=urlparse(self.path).path
+        if path in ("/","/index.html"): self.send_data(HTML)
+        elif path=="/api/stats":
+            with lock:
+                data=dict(latest)
+                data["history"]=list(history)
+            self.send_data(json.dumps(data),"application/json")
+        else: self.send_data("Not Found","text/plain",404)
+
+def stop(*args):
+    global running; running=False
+    try: httpd.shutdown()
+    except Exception: pass
+
+def main():
+    global latest,httpd
+    if os.geteuid()!=0: print("Warning: gunakan sudo agar semua log dapat dibaca.\n")
+    ip=get_ip()
+    print(f"\nWeb Server Log Intelligence {VERSION}\n"+"="*72)
+    print(f"Dashboard : http://{ip}:{PORT}")
+    print(f"Hostname  : {socket.gethostname()}")
+    print("Domain    : Detecting...")
+    print("Mode      : foreground"); print(f"Refresh   : {REFRESH} seconds"); print("="*72)
+    try: httpd=ThreadingHTTPServer((HOST,PORT),Handler); httpd.daemon_threads=True
+    except OSError as e: print(f"ERROR: port {PORT} tidak dapat digunakan: {e}"); sys.exit(1)
+    threading.Thread(target=httpd.serve_forever,daemon=True).start()
+    signal.signal(signal.SIGINT,stop); signal.signal(signal.SIGTERM,stop)
+    while running:
+        try:
+            d=make_snapshot()
+            with lock: latest=d
+            add_history(d)
+            show_console(d)
+            for _ in range(REFRESH):
+                if not running: break
+                time.sleep(1)
+        except KeyboardInterrupt: stop()
+        except Exception as e: print(f"Analyzer error: {e}"); time.sleep(3)
+    httpd.server_close(); print("\nStopped.")
+
+if __name__=="__main__": main()
