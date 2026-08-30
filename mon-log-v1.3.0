@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from datetime import datetime
 
-VERSION="1.3.0"; HOST="0.0.0.0"; PORT=8080; REFRESH=5
+VERSION="1.4.0"; HOST="0.0.0.0"; PORT=8080; REFRESH=5
 ROOTS=[Path("/var/log/apache2"),Path("/var/log/nginx"),Path("/var/log/httpd")]
 ACCESS_RE=re.compile(r"(^|[-_.])(access|request|requests)([-_.]|$)",re.I)
 ERROR_RE=re.compile(r"(^|[-_.])(error|errors|err)([-_.]|$)",re.I)
@@ -17,7 +17,7 @@ REQ_RE=re.compile(r'"([A-Z]+)\s+(\S+)(?:\s+HTTP/[0-9.]+)?"')
 STATUS_RE=re.compile(r'"\s+(\d{3})\s+')
 APACHE_RE=re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<method>[A-Z]+)\s+(?P<path>\S+)(?:\s+[^"]*)?"\s+(?P<status>\d{3})\s+(?P<size>\S+)')
 DOMAIN_RE=re.compile(r'\b(?:www\.)?[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}\b')
-lock=threading.Lock(); latest={}; history=[]; file_state={}; running=True; httpd=None
+lock=threading.Lock(); latest={}; history=[]; historical=defaultdict(lambda: {"hits":0,"errors":0,"bytes":0}); file_state={}; running=True; httpd=None
 
 def get_ip():
     candidates=[]
@@ -86,6 +86,51 @@ def parse_access(line):
         return ip.group(0) if ip else "-",r.group(1),r.group(2),int(s.group(1)),0
     return None
 
+def parse_log_datetime(line):
+    """Parse common Apache/Nginx access and error timestamps."""
+    # Apache/Nginx access logs:
+    # [31/Aug/2026:06:12:44 +0800]
+    m=re.search(r"\[([0-9]{2}/[A-Za-z]{3}/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}(?: [+-][0-9]{4})?)\]",line)
+    if m:
+        raw=m.group(1)
+        for fmt in ("%d/%b/%Y:%H:%M:%S %z","%d/%b/%Y:%H:%M:%S"):
+            try:
+                dt=datetime.strptime(raw,fmt)
+                if dt.tzinfo:
+                    return dt.timestamp()
+                return dt.replace(tzinfo=None).timestamp()
+            except ValueError:
+                pass
+
+    # Apache error.log commonly:
+    # [Mon Aug 31 06:12:44.123456 2026]
+    m=re.search(r"\[[A-Za-z]{3} ([A-Za-z]{3}) ([ 0-9]{1,2}) ([0-9:]{8})(?:\.[0-9]+)? ([0-9]{4})\]",line)
+    if m:
+        raw=f"{m.group(1)} {m.group(2)} {m.group(3)} {m.group(4)}"
+        try:
+            return datetime.strptime(raw,"%b %d %H:%M:%S %Y").timestamp()
+        except ValueError:
+            pass
+
+    # Nginx error.log commonly:
+    # 2026/08/31 06:12:44 [error] ...
+    m=re.search(r"\b([0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\b",line)
+    if m:
+        try:
+            return datetime.strptime(m.group(1),"%Y/%m/%d %H:%M:%S").timestamp()
+        except ValueError:
+            pass
+    return None
+
+def record_historical(ts,hits=0,errors=0,bytes_count=0):
+    if ts is None:
+        return
+    minute=int(ts//60)*60
+    b=historical[minute]
+    b["hits"]+=hits
+    b["errors"]+=errors
+    b["bytes"]+=bytes_count
+
 def _new_counters():
     return {"lines":0,"hits":0,"errors":0,"bytes":0,
             "statuses":Counter(),"methods":Counter(),"paths":Counter(),"ips":Counter()}
@@ -113,8 +158,10 @@ def analyze(p,kind):
                         st["data"]["methods"][method]+=1
                         st["data"]["paths"][path]+=1
                         if ip!="-": st["data"]["ips"][ip]+=1
+                        record_historical(parse_log_datetime(line),hits=1,bytes_count=sz)
                 elif re.search(r"\b(error|crit|alert|emerg|warn)\b",line,re.I):
                     st["data"]["errors"]+=1
+                    record_historical(parse_log_datetime(line),errors=1)
             st["offset"]=f.tell()
         file_state[key]=st
     except (OSError,PermissionError):
@@ -259,7 +306,7 @@ table{width:100%;border-collapse:collapse;font-size:10px}th,td{padding:8px 7px;b
 </head>
 <body>
 <header><div class="head">
-<div class="brand"><div class="brandmark">↯</div><div><h1>Web Server Log Intelligence <span id="ver"></span></h1><div class="subtitle">Apache2 / Nginx • automatic log detection • VHost analytics</div></div></div>
+<div class="brand"><div class="brandmark">↯</div><div><h1>Web Server Log Intelligence <span id="ver"></span></h1><div class="subtitle">Apache2 / Nginx • automatic log detection • VHost analytics • historical timestamp analysis</div></div></div>
 <div class="live"><span class="pulse"></span> Live monitoring <span id="refreshState">• updating</span></div>
 </div></header>
 <main>
@@ -283,7 +330,7 @@ table{width:100%;border-collapse:collapse;font-size:10px}th,td{padding:8px 7px;b
 </div>
 <div class="card section" style="padding:12px">
 <div class="cardtitle" style="margin-bottom:0">
-<h2>Graph Timeframe</h2>
+<h2>Historical Log Timeframe</h2>
 <div style="display:flex;gap:6px;flex-wrap:wrap">
 <button class="range active" data-range="300">5m</button>
 <button class="range" data-range="900">15m</button>
@@ -295,7 +342,7 @@ table{width:100%;border-collapse:collapse;font-size:10px}th,td{padding:8px 7px;b
 </div>
 </div>
 <div class="two section">
-<div class="card"><div class="cardtitle"><h2>Request Trend</h2><span class="badge" id="trendBadge">LIVE • 5 min • 5 sec</span></div><div class="legend"><span class="hits">Hits</span><span class="errors">Errors</span></div><div class="chart"><svg id="trend" viewBox="0 0 900 245" preserveAspectRatio="none"></svg></div></div>
+<div class="card"><div class="cardtitle"><h2>Request Trend</h2><span class="badge" id="trendBadge">LOG TIMESTAMP • 5 min</span></div><div class="legend"><span class="hits">Hits</span><span class="errors">Errors</span></div><div class="chart"><svg id="trend" viewBox="0 0 900 245" preserveAspectRatio="none"></svg></div></div>
 <div class="card"><div class="cardtitle"><h2>HTTP Status Distribution</h2><span class="badge">All access logs</span></div><div class="donutbox"><div class="donut" id="donut"><div class="donutcenter"><b id="statusTotal">0</b><span>responses</span></div></div><div class="legendlist" id="statusLegend"></div></div></div>
 </div>
 <div class="three section">
@@ -305,7 +352,7 @@ table{width:100%;border-collapse:collapse;font-size:10px}th,td{padding:8px 7px;b
 </div>
 <div class="card section"><div class="cardtitle"><h2>Domain / VHost Statistics</h2><span class="badge">Access + Error + Traffic</span></div><div class="scroll"><table><thead><tr><th>Domain / VHost</th><th>Hits</th><th>Errors</th><th>Traffic</th><th>Status</th></tr></thead><tbody id="domainTable"></tbody></table></div></div>
 <div class="card section"><div class="cardtitle"><h2>Detected Log Files</h2><span class="badge" id="logBadge">0 files</span></div><div class="scroll"><table><thead><tr><th>Type</th><th>Log File</th><th>Domain</th><th>Hits</th><th>Errors</th></tr></thead><tbody id="files"></tbody></table></div></div>
-<div class="footer">Server: <span id="server">-</span> • Last update: <span id="updated">-</span> • Auto refresh: 5 seconds</div>
+<div class="footer">Server: <span id="server">-</span> • Last update: <span id="updated">-</span> • Historical data: log timestamp • Auto refresh: 5 seconds</div>
 </main>
 <script>
 const E=s=>String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
@@ -358,7 +405,7 @@ async function load(){
   document.getElementById('webserver').textContent=ws.length?ws.map(x=>x.name+' '+x.version).join(' / '):'Not detected';
   document.getElementById('webserverPath').textContent=ws.length?ws.map(x=>x.path).join(' • '):'Check PATH';document.getElementById('logBadge').textContent=F(s.log_files)+' files';
   document.getElementById('paths').innerHTML=list(d.top_paths);document.getElementById('iplist').innerHTML=list(d.top_ips);
-  document.getElementById('trendBadge').textContent='LIVE • '+(graphRange<3600?Math.round(graphRange/60)+' min':Math.round(graphRange/3600)+' h')+' • 5 sec';drawTrend(d.history||[]);drawStatus(d.statuses);drawMethods(d.methods);drawDomains(d.domains);
+  document.getElementById('trendBadge').textContent='LOG TIMESTAMP • '+(graphRange<3600?Math.round(graphRange/60)+' min':Math.round(graphRange/3600)+' h')+' • 5 sec';drawTrend(d.history||[]);drawStatus(d.statuses);drawMethods(d.methods);drawDomains(d.domains);
   document.getElementById('files').innerHTML=d.files.map(x=>`<tr><td>${E(x.kind)}</td><td>${E(x.file)}</td><td>${E(x.domain)}</td><td>${F(x.hits)}</td><td>${F(x.errors)}</td></tr>`).join('');
   document.getElementById('refreshState').textContent='• updated';
   }catch(e){
@@ -383,8 +430,8 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 data=dict(latest)
                 h=list(history)
-            # Filter graph history server-side to avoid sending a full 24-hour
-            # series on every 5-second refresh.
+            # Reconstruct graph directly from timestamps found in the logs.
+            # This is historical data, not merely the five-second runtime samples.
             q=urlparse(self.path).query
             from urllib.parse import parse_qs
             params=parse_qs(q)
@@ -392,17 +439,21 @@ class Handler(BaseHTTPRequestHandler):
                 seconds=int(params.get("range",["900"])[0])
             except ValueError:
                 seconds=900
-            if seconds>0:
-                cutoff=time.time()-seconds
-                filtered=[]
-                for item in h:
-                    try:
-                        ts=datetime.strptime(item["time"],"%Y-%m-%d %H:%M:%S").timestamp()
-                        if ts>=cutoff: filtered.append(item)
-                    except Exception: pass
-                data["history"]=filtered
-            else:
-                data["history"]=h
+            now=int(time.time())
+            cutoff=now-seconds if seconds>0 else 0
+            points=[]
+            with lock:
+                keys=sorted(k for k in historical if k>=cutoff)
+                hist=dict(historical)
+            for ts in keys:
+                item=hist[ts]
+                points.append({
+                    "time":datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                    "hits":item["hits"],
+                    "errors":item["errors"],
+                    "bytes":item["bytes"]
+                })
+            data["history"]=points
             self.send_data(json.dumps(data),"application/json")
         else: self.send_data("Not Found","text/plain",404)
 
